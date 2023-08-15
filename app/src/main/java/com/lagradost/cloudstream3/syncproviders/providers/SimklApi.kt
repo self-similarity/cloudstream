@@ -495,6 +495,9 @@ class SimklApi(index: Int) : AccountManager(index), SyncAPI {
         val episodes: Array<EpisodeMetadata>?,
         override var isFavorite: Boolean? = null,
         override var maxEpisodes: Int? = null,
+        /** Save seen episodes separately to know the change from old to new.
+         * Required to remove seen episodes if count decreases */
+        val oldEpisodes: Int,
     ) : SyncAPI.AbstractSyncStatus()
 
     override suspend fun getStatus(id: String): SyncAPI.AbstractSyncStatus? {
@@ -518,7 +521,8 @@ class SimklApi(index: Int) : AccountManager(index), SyncAPI {
                 score = foundItem.user_rating,
                 watchedEpisodes = foundItem.watched_episodes_count,
                 maxEpisodes = foundItem.total_episodes_count,
-                episodes = episodes
+                episodes = episodes,
+                oldEpisodes = foundItem.watched_episodes_count ?: 0,
             )
         } else {
             return if (searchResult != null) {
@@ -527,7 +531,8 @@ class SimklApi(index: Int) : AccountManager(index), SyncAPI {
                     score = 0,
                     watchedEpisodes = 0,
                     maxEpisodes = if (searchResult.type == "movie") 0 else null,
-                    episodes = episodes
+                    episodes = episodes,
+                    oldEpisodes = 0,
                 )
             } else {
                 null
@@ -601,32 +606,46 @@ class SimklApi(index: Int) : AccountManager(index), SyncAPI {
                     SimklListStatusType.ReWatching.value
                 ).contains(status.status)
             ) {
-                val cutEpisodes = simklStatus.episodes.take(watchedEpisodes)
-
-                val (seasons, episodes) = if (cutEpisodes.any { it.season != null }) {
-                    EpisodeMetadata.convertToSeasons(cutEpisodes) to null
-                } else {
-                    null to EpisodeMetadata.convertToEpisodes(cutEpisodes)
+                suspend fun postEpisodes(
+                    url: String,
+                    rawEpisodes: List<EpisodeMetadata>
+                ): Boolean {
+                    val (seasons, episodes) = if (rawEpisodes.any { it.season != null }) {
+                        EpisodeMetadata.convertToSeasons(rawEpisodes) to null
+                    } else {
+                        null to EpisodeMetadata.convertToEpisodes(rawEpisodes)
+                    }
+                    debugPrint { "Synced history using $url: seasons=${seasons?.toList()}, episodes=${episodes?.toList()}" }
+                    return app.post(
+                        url,
+                        json = StatusRequest(
+                            shows = listOf(
+                                HistoryMediaObject(
+                                    null,
+                                    null,
+                                    MediaObject.Ids.fromMap(parsedId),
+                                    seasons,
+                                    episodes
+                                )
+                            ),
+                            movies = emptyList()
+                        ),
+                        interceptor = interceptor
+                    ).isSuccessful
                 }
 
-                debugPrint { "Synced history for ${status.watchedEpisodes} given size of ${simklStatus.episodes.size}: seasons=${seasons?.toList()}, episodes=${episodes?.toList()}" }
-                val episodeResponse = app.post(
-                    "$mainUrl/sync/history",
-                    json = StatusRequest(
-                        shows = listOf(
-                            HistoryMediaObject(
-                                null,
-                                null,
-                                MediaObject.Ids.fromMap(parsedId),
-                                seasons,
-                                episodes
-                            )
-                        ),
-                        movies = emptyList()
-                    ),
-                    interceptor = interceptor
-                )
-                episodeResponse.isSuccessful
+                // If episodes decrease: remove all episodes beyond watched episodes.
+                val removeResponse = if (simklStatus.oldEpisodes > watchedEpisodes) {
+                    val removeEpisodes = simklStatus.episodes
+                        .drop(watchedEpisodes)
+                    postEpisodes("$mainUrl/sync/history/remove", removeEpisodes)
+                } else {
+                    true
+                }
+                val cutEpisodes = simklStatus.episodes.take(watchedEpisodes)
+                val addResponse = postEpisodes("$mainUrl/sync/history/", cutEpisodes)
+
+                removeResponse && addResponse
             } else true
 
         val newStatus =
